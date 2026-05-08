@@ -7,7 +7,7 @@ from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filte
 from openai import OpenAI
 
 # ─────────────────────────────────────────────
-#  CONFIGURAÇÕES — preencha suas chaves aqui
+#  CONFIGURAÇÕES
 # ─────────────────────────────────────────────
 import os
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -22,7 +22,7 @@ xai_client = OpenAI(
 )
 
 # ─────────────────────────────────────────────
-#  SYSTEM PROMPT COMPLETO
+#  SYSTEM PROMPT PRINCIPAL
 # ─────────────────────────────────────────────
 SYSTEM_PROMPT = """Você é o agente virtual de reembolso da equipe de suporte da AIVA.
 
@@ -87,11 +87,6 @@ ETAPA 4 — RESOLUÇÃO FINAL
 
 ▸ SE O CLIENTE QUISER CONTINUAR COM O REEMBOLSO:
   Peça para confirmar os dados novamente (nome, e-mail, CPF, data da compra).
-  (O sistema aguardará 5 minutos e então enviará a mensagem de confirmação.)
-  Após isso, responda automaticamente:
-  "Pronto, basta aguardar que logo seu reembolso será concluído.
-   → PIX: prazo de até 72h
-   → Cartão: prazo de até 30 dias"
 
 ▸ APÓS CONCLUIR O PROCESSO:
   Para qualquer mensagem adicional do cliente, responda algo relacionado a:
@@ -108,20 +103,28 @@ REGRAS GERAIS
 """
 
 # ─────────────────────────────────────────────
+#  SYSTEM PROMPT PÓS-REEMBOLSO
+# ─────────────────────────────────────────────
+SYSTEM_PROMPT_POS_REEMBOLSO = """Você é um atendente de suporte. O cliente já teve seu reembolso confirmado e processado.
+Responda à mensagem do cliente de forma natural, empática e VARIADA — nunca repita a mesma resposta.
+SEMPRE termine transmitindo a ideia de que a solicitação está em andamento e que ele só precisa aguardar.
+Seja breve (1-2 frases), humano e caloroso. Varie bastante o vocabulário e a estrutura das frases.
+Responda sempre em português brasileiro."""
+
+# ─────────────────────────────────────────────
 #  ESTADOS POR USUÁRIO
 # ─────────────────────────────────────────────
-# Cada chave é o user_id do Telegram
-# Campos: history, stage, waiting_until
 user_state: dict[int, dict] = {}
+user_locks: dict[int, asyncio.Lock] = {}
 
-STAGE_INICIO          = "inicio"
+STAGE_INICIO           = "inicio"
 STAGE_AGUARDANDO_DADOS = "aguardando_dados"
-STAGE_CHECANDO        = "checando"          # aguarda 3 min
+STAGE_CHECANDO         = "checando"
 STAGE_PERGUNTOU_MOTIVO = "perguntou_motivo"
-STAGE_OBJECOES        = "objecoes"
-STAGE_CONFIRMANDO     = "confirmando"       # aguarda 5 min antes de encerrar
-STAGE_CONCLUIDO       = "concluido"
-STAGE_FORA_PRAZO      = "fora_prazo"
+STAGE_OBJECOES         = "objecoes"
+STAGE_CONFIRMANDO      = "confirmando"
+STAGE_CONCLUIDO        = "concluido"
+STAGE_FORA_PRAZO       = "fora_prazo"
 
 logging.basicConfig(level=logging.INFO)
 
@@ -132,8 +135,15 @@ def get_state(user_id: int) -> dict:
             "history": [],
             "stage": STAGE_INICIO,
             "waiting_until": None,
+            "concluded_at": None,
         }
     return user_state[user_id]
+
+
+def get_lock(user_id: int) -> asyncio.Lock:
+    if user_id not in user_locks:
+        user_locks[user_id] = asyncio.Lock()
+    return user_locks[user_id]
 
 
 def ask_grok(history: list[dict]) -> str:
@@ -146,18 +156,28 @@ def ask_grok(history: list[dict]) -> str:
     return response.choices[0].message.content.strip()
 
 
+def ask_grok_pos_reembolso(user_text: str) -> str:
+    response = xai_client.chat.completions.create(
+        model="grok-4-fast",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT_POS_REEMBOLSO},
+            {"role": "user", "content": user_text}
+        ],
+        max_tokens=200,
+        temperature=0.95,
+    )
+    return response.choices[0].message.content.strip()
+
+
 def detect_data_completa(text: str) -> bool:
-    """Verifica (superficialmente) se o cliente mandou os 4 dados."""
-    text_lower = text.lower()
-    has_email   = "@" in text
-    has_cpf     = any(c.isdigit() for c in text) and len([c for c in text if c.isdigit()]) >= 11
-    has_date    = "/" in text
-    has_name    = len(text.split()) >= 3
+    has_email = "@" in text
+    has_cpf   = len([c for c in text if c.isdigit()]) >= 11
+    has_date  = "/" in text
+    has_name  = len(text.split()) >= 3
     return has_email and has_cpf and has_date and has_name
 
 
 def extract_date(text: str) -> datetime | None:
-    """Tenta extrair data no formato DD/MM/AAAA do texto."""
     import re
     matches = re.findall(r"\b(\d{2})/(\d{2})/(\d{4})\b", text)
     for d, m, y in matches:
@@ -173,138 +193,138 @@ def dentro_do_prazo(data_compra: datetime) -> bool:
 
 
 def detect_quer_reembolso(text: str) -> bool:
-    """Detecta se após objeções o cliente ainda quer reembolso."""
     keywords = ["quero reembolso", "quero o reembolso", "continuar com o reembolso",
                 "estornar", "estorno", "devolver", "devolução", "não quero mais",
                 "nao quero mais", "mantém", "mantem o reembolso"]
-    text_lower = text.lower()
-    return any(k in text_lower for k in keywords)
+    return any(k in text.lower() for k in keywords)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id   = update.message.chat_id
     user_text = update.message.text or ""
     state     = get_state(user_id)
+    lock      = get_lock(user_id)
 
-    # ── Se existe um timer ativo, verificar se já passou ──────────────────────
-    if state["waiting_until"] and datetime.now() < state["waiting_until"]:
-        # ainda no período de espera — não responde
+    # ── Anti-duplicidade: ignora se já está processando mensagem deste usuário ─
+    if lock.locked():
         return
 
-    # ── Adiciona mensagem do usuário ao histórico ─────────────────────────────
-    state["history"].append({"role": "user", "content": user_text})
+    async with lock:
 
-    # ── FLUXO POR ETAPA ───────────────────────────────────────────────────────
+        # ── Timer ativo: não responde ─────────────────────────────────────────
+        if state["waiting_until"] and datetime.now() < state["waiting_until"]:
+            return
 
-    # ETAPA CONCLUÍDA — respostas baseadas no estágio e prazo
-    if state["stage"] == STAGE_FORA_PRAZO:
-        reply = "Sua solicitação já está em andamento, basta aguardar. 😊"
-        await update.message.reply_text(reply)
-        state["history"].append({"role": "assistant", "content": reply})
-        return
+        # ── Adiciona ao histórico ─────────────────────────────────────────────
+        state["history"].append({"role": "user", "content": user_text})
 
-    if state["stage"] == STAGE_CONCLUIDO:
-        # Verifica se ainda está dentro do prazo de devolução (72h PIX / 30 dias cartão)
-        concluded_at = state.get("concluded_at")
-        if concluded_at:
-            horas_passadas = (datetime.now() - concluded_at).total_seconds() / 3600
-            if horas_passadas <= 72:
-                reply = f"Seu reembolso está sendo processado! O prazo é de até 72h para PIX e até 30 dias para cartão. Basta aguardar. 😊"
+        # ─────────────────────────────────────────────────────────────────────
+        # FORA DO PRAZO — resposta natural variada com ideia de aguardar
+        # ─────────────────────────────────────────────────────────────────────
+        if state["stage"] == STAGE_FORA_PRAZO:
+            reply = ask_grok_pos_reembolso(user_text)
+            await update.message.reply_text(reply)
+            state["history"].append({"role": "assistant", "content": reply})
+            return
+
+        # ─────────────────────────────────────────────────────────────────────
+        # CONCLUÍDO — sempre variado, sempre termina com ideia de aguardar
+        # ─────────────────────────────────────────────────────────────────────
+        if state["stage"] == STAGE_CONCLUIDO:
+            reply = ask_grok_pos_reembolso(user_text)
+            await update.message.reply_text(reply)
+            state["history"].append({"role": "assistant", "content": reply})
+            return
+
+        # ─────────────────────────────────────────────────────────────────────
+        # INICIO
+        # ─────────────────────────────────────────────────────────────────────
+        if state["stage"] == STAGE_INICIO:
+            reply = ask_grok(state["history"])
+            state["stage"] = STAGE_AGUARDANDO_DADOS
+
+        # ─────────────────────────────────────────────────────────────────────
+        # AGUARDANDO DADOS
+        # ─────────────────────────────────────────────────────────────────────
+        elif state["stage"] == STAGE_AGUARDANDO_DADOS:
+            if detect_data_completa(user_text):
+                data_compra = extract_date(user_text)
+                if data_compra and not dentro_do_prazo(data_compra):
+                    state["stage"] = STAGE_FORA_PRAZO
+                    reply = ask_grok(state["history"])
+                else:
+                    reply = "Ok, só um instante que vou checar o sistema! 🔍"
+                    state["stage"] = STAGE_CHECANDO
+                    state["waiting_until"] = datetime.now() + timedelta(minutes=3)
+                    await update.message.reply_text(reply)
+                    state["history"].append({"role": "assistant", "content": reply})
+
+                    async def send_motivo():
+                        await asyncio.sleep(180)
+                        motivo_msg = "Show, o que houve pra você tomar essa decisão de desistir do projeto? 🤔"
+                        try:
+                            await context.bot.send_message(chat_id=user_id, text=motivo_msg)
+                            state["history"].append({"role": "assistant", "content": motivo_msg})
+                            state["stage"] = STAGE_PERGUNTOU_MOTIVO
+                            state["waiting_until"] = None
+                        except Exception as e:
+                            logging.error(f"Erro ao enviar motivo: {e}")
+
+                    asyncio.create_task(send_motivo())
+                    return
             else:
-                reply = "Sua solicitação já está em andamento, basta aguardar. 😊"
-        else:
-            reply = "Sua solicitação já está em andamento, basta aguardar. 😊"
-        await update.message.reply_text(reply)
-        state["history"].append({"role": "assistant", "content": reply})
-        return
+                reply = ask_grok(state["history"])
 
-    # INICIO — boas-vindas + solicita dados
-    if state["stage"] == STAGE_INICIO:
-        reply = ask_grok(state["history"])
-        state["stage"] = STAGE_AGUARDANDO_DADOS
-
-    # AGUARDANDO DADOS — verifica se vieram e checa prazo
-    elif state["stage"] == STAGE_AGUARDANDO_DADOS:
-        if detect_data_completa(user_text):
-            data_compra = extract_date(user_text)
-            if data_compra and not dentro_do_prazo(data_compra):
-                # Fora do prazo
-                state["stage"] = STAGE_FORA_PRAZO
-                reply = ask_grok(state["history"])  # o prompt instrui a informar bloqueio
-            else:
-                # Dentro do prazo → responde "ok instante" e agenda 3 min
-                reply = "Ok, só um instante que vou checar o sistema! 🔍"
-                state["stage"] = STAGE_CHECANDO
-                state["waiting_until"] = datetime.now() + timedelta(minutes=3)
-                await update.message.reply_text(reply)
-                state["history"].append({"role": "assistant", "content": reply})
-
-                # Agenda a pergunta do motivo após 3 min
-                async def send_motivo():
-                    await asyncio.sleep(180)
-                    motivo_msg = "Show, o que houve pra você tomar essa decisão de desistir do projeto? 🤔"
-                    try:
-                        await context.bot.send_message(chat_id=user_id, text=motivo_msg)
-                        state["history"].append({"role": "assistant", "content": motivo_msg})
-                        state["stage"] = STAGE_PERGUNTOU_MOTIVO
-                        state["waiting_until"] = None
-                    except Exception as e:
-                        logging.error(f"Erro ao enviar pergunta de motivo: {e}")
-
-                asyncio.create_task(send_motivo())
-                return
-        else:
-            # Dados incompletos — pede novamente via Grok
+        # ─────────────────────────────────────────────────────────────────────
+        # PERGUNTOU MOTIVO
+        # ─────────────────────────────────────────────────────────────────────
+        elif state["stage"] == STAGE_PERGUNTOU_MOTIVO:
+            state["stage"] = STAGE_OBJECOES
             reply = ask_grok(state["history"])
 
-    # PERGUNTOU MOTIVO — cliente respondeu o motivo → tenta quebrar objeção
-    elif state["stage"] == STAGE_PERGUNTOU_MOTIVO:
-        state["stage"] = STAGE_OBJECOES
-        reply = ask_grok(state["history"])
+        # ─────────────────────────────────────────────────────────────────────
+        # OBJEÇÕES
+        # ─────────────────────────────────────────────────────────────────────
+        elif state["stage"] == STAGE_OBJECOES:
+            if detect_quer_reembolso(user_text):
+                state["stage"] = STAGE_CONFIRMANDO
+                reply = ask_grok(state["history"])
 
-    # OBJEÇÕES — cliente pode aceitar ficar ou insistir no reembolso
-    elif state["stage"] == STAGE_OBJECOES:
-        if detect_quer_reembolso(user_text):
-            # Quer continuar com reembolso → pede confirmação dos dados
-            state["stage"] = STAGE_CONFIRMANDO
-            reply = ask_grok(state["history"])
-
-            # Agenda mensagem final após 5 min
-            async def send_conclusao():
-                await asyncio.sleep(300)
-                conclusao_msg = (
-                    "Pronto, basta aguardar que logo seu reembolso será concluído! ✅\n\n"
-                    "💠 *PIX:* prazo de até 72h\n"
-                    "💳 *Cartão:* prazo de até 30 dias"
-                )
-                try:
-                    await context.bot.send_message(
-                        chat_id=user_id, text=conclusao_msg, parse_mode="Markdown"
+                async def send_conclusao():
+                    await asyncio.sleep(300)
+                    conclusao_msg = (
+                        "Pronto, basta aguardar que logo seu reembolso será concluído! ✅\n\n"
+                        "💠 *PIX:* prazo de até 72h\n"
+                        "💳 *Cartão:* prazo de até 30 dias"
                     )
-                    state["history"].append({"role": "assistant", "content": conclusao_msg})
+                    try:
+                        await context.bot.send_message(
+                            chat_id=user_id, text=conclusao_msg, parse_mode="Markdown"
+                        )
+                        state["history"].append({"role": "assistant", "content": conclusao_msg})
+                        state["stage"] = STAGE_CONCLUIDO
+                        state["concluded_at"] = datetime.now()
+                    except Exception as e:
+                        logging.error(f"Erro ao enviar conclusão: {e}")
+
+                asyncio.create_task(send_conclusao())
+            else:
+                reply = ask_grok(state["history"])
+                despedida_keywords = ["conte conosco", "boa sorte", "qualquer dúvida", "estamos aqui"]
+                if any(k in reply.lower() for k in despedida_keywords):
                     state["stage"] = STAGE_CONCLUIDO
-                    state["concluded_at"] = datetime.now()
-                except Exception as e:
-                    logging.error(f"Erro ao enviar conclusão: {e}")
 
-            asyncio.create_task(send_conclusao())
+        # ─────────────────────────────────────────────────────────────────────
+        # CONFIRMANDO
+        # ─────────────────────────────────────────────────────────────────────
+        elif state["stage"] == STAGE_CONFIRMANDO:
+            reply = "Perfeito! Aguarde só um momento enquanto finalizamos sua solicitação. 🔄"
+
         else:
-            # Ainda nas objeções ou aceitou ficar
             reply = ask_grok(state["history"])
-            # Se Grok se despede, encerra
-            despedida_keywords = ["conte conosco", "boa sorte", "qualquer dúvida", "estamos aqui"]
-            if any(k in reply.lower() for k in despedida_keywords):
-                state["stage"] = STAGE_CONCLUIDO
 
-    # CONFIRMANDO — aguarda 5 min (tratado pela task acima); qualquer msg aqui é ignorada ou respondida
-    elif state["stage"] == STAGE_CONFIRMANDO:
-        reply = "Perfeito! Aguarde só um momento enquanto finalizamos sua solicitação. 🔄"
-
-    else:
-        reply = ask_grok(state["history"])
-
-    await update.message.reply_text(reply)
-    state["history"].append({"role": "assistant", "content": reply})
+        await update.message.reply_text(reply)
+        state["history"].append({"role": "assistant", "content": reply})
 
 
 # ─────────────────────────────────────────────
