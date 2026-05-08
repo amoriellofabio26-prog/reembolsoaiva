@@ -9,8 +9,9 @@ from openai import OpenAI
 # ─────────────────────────────────────────────
 #  CONFIGURAÇÕES — preencha suas chaves aqui
 # ─────────────────────────────────────────────
-TELEGRAM_TOKEN = "SEU_TOKEN_DO_TELEGRAM"
-XAI_API_KEY    = "SUA_CHAVE_API_XAI"
+import os
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+XAI_API_KEY    = os.environ.get("XAI_API_KEY")
 
 # ─────────────────────────────────────────────
 #  CLIENTE XAI (Grok)
