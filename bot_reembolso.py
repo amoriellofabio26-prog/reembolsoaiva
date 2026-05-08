@@ -9,10 +9,8 @@ from openai import OpenAI
 # ─────────────────────────────────────────────
 #  CONFIGURAÇÕES — preencha suas chaves aqui
 # ─────────────────────────────────────────────
-
-import os
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-XAI_API_KEY    = os.environ.get("XAI_API_KEY")
+TELEGRAM_TOKEN = "SEU_TOKEN_DO_TELEGRAM"
+XAI_API_KEY    = "SUA_CHAVE_API_XAI"
 
 # ─────────────────────────────────────────────
 #  CLIENTE XAI (Grok)
@@ -197,9 +195,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── FLUXO POR ETAPA ───────────────────────────────────────────────────────
 
-    # ETAPA CONCLUÍDA — qualquer mensagem recebe resposta padrão
-    if state["stage"] in (STAGE_CONCLUIDO, STAGE_FORA_PRAZO):
+    # ETAPA CONCLUÍDA — respostas baseadas no estágio e prazo
+    if state["stage"] == STAGE_FORA_PRAZO:
         reply = "Sua solicitação já está em andamento, basta aguardar. 😊"
+        await update.message.reply_text(reply)
+        state["history"].append({"role": "assistant", "content": reply})
+        return
+
+    if state["stage"] == STAGE_CONCLUIDO:
+        # Verifica se ainda está dentro do prazo de devolução (72h PIX / 30 dias cartão)
+        concluded_at = state.get("concluded_at")
+        if concluded_at:
+            horas_passadas = (datetime.now() - concluded_at).total_seconds() / 3600
+            if horas_passadas <= 72:
+                reply = f"Seu reembolso está sendo processado! O prazo é de até 72h para PIX e até 30 dias para cartão. Basta aguardar. 😊"
+            else:
+                reply = "Sua solicitação já está em andamento, basta aguardar. 😊"
+        else:
+            reply = "Sua solicitação já está em andamento, basta aguardar. 😊"
         await update.message.reply_text(reply)
         state["history"].append({"role": "assistant", "content": reply})
         return
@@ -269,6 +282,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     state["history"].append({"role": "assistant", "content": conclusao_msg})
                     state["stage"] = STAGE_CONCLUIDO
+                    state["concluded_at"] = datetime.now()
                 except Exception as e:
                     logging.error(f"Erro ao enviar conclusão: {e}")
 
